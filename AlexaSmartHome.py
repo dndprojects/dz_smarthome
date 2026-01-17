@@ -24,52 +24,9 @@ class Registry(dict):
 
 INTERFACES = Registry()
 
-class AlexaEndpoint(object):
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        self._endpointId = endpointId
-        self._friendlyName = friendlyName
-        self._description = description
-        self._manufacturerName = manufacturerName
-        self._capabilities = []
-        self._displayCategories = []
-        self._cookies = {}
-
-    def endpointId(self):
-        return self._endpointId
-
-    def friendlyName(self):
-        return self._friendlyName
-
-    def description(self):
-        return self._description
-
-    def manufacturerName(self):
-        return self._manufacturerName
-
-    def displayCategories(self):
-        return self._displayCategories
-
-    def capabilities(self):
-        return self._capabilities
-
-    def cookies(self):
-        return self._cookies
-
-    def getProperty(self, name):
-        return None
-
-    def addDisplayCategories(self, category):
-        self._displayCategories.append(category)
-
-    def addCapability(self, interface):
-        self._capabilities.append(interface)
-
-    def addCookie(self, dict):
-        for k, v in dict.items():
-            self._cookies[k] = v
-
 class AlexaInterface:
 
+    # UPDATED: Set proactivelyReported to True by default to enable state updates in Alexa app.
     def __init__(self, endpoint, name = 'Alexa', properties = [], proactivelyReported = True, retrievable = True, modesSupported = None, deactivationSupported = None):
         self._endpoint = endpoint
         self._name = name
@@ -114,17 +71,16 @@ class AlexaInterface:
             'type': 'AlexaInterface',
             'interface': self.name(),
             'version': self.version(),
-            'properties': {
-                'supported': self.propertiesSupported(),
+        }
+        props = self.propertiesSupported()
+        if props:
+            result['properties'] = {
+                'supported': props,
                 'proactivelyReported': self.propertiesProactivelyReported(),
                 'retrievable': self.propertiesRetrievable(),
-            },
-        }
+            }
         if self.configuration() is not None:
             result['configuration'] = self.configuration()
-        supports_deactivation = self.supportsDeactivation()
-        if supports_deactivation is not None:
-            result['supportsDeactivation'] = supports_deactivation
         return result
 
     def serializeProperties(self):
@@ -136,9 +92,53 @@ class AlexaInterface:
                     'name': prop_name,
                     'namespace': self.name(),
                     'value': prop_value,
-                    'timeOfSample': datetime.now().replace(microsecond=0).isoformat()+"Z",
+                    'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat()+"Z",
                     'uncertaintyInMilliseconds': 0,
                 }
+
+class AlexaEndpoint(object):
+    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
+        self._endpointId = endpointId
+        self._friendlyName = friendlyName
+        self._description = description
+        self._manufacturerName = manufacturerName
+        self._capabilities = [AlexaInterface(self)]
+        self._displayCategories = []
+        self._cookies = {}
+
+    def endpointId(self):
+        return self._endpointId
+
+    def friendlyName(self):
+        return self._friendlyName
+
+    def description(self):
+        return self._description
+
+    def manufacturerName(self):
+        return self._manufacturerName
+
+    def displayCategories(self):
+        return self._displayCategories
+
+    def capabilities(self):
+        return self._capabilities
+
+    def cookies(self):
+        return self._cookies
+
+    def getProperty(self, name):
+        return None
+
+    def addDisplayCategories(self, category):
+        self._displayCategories.append(category)
+
+    def addCapability(self, interface):
+        self._capabilities.append(interface)
+
+    def addCookie(self, dict):
+        for k, v in dict.items():
+            self._cookies[k] = v
 
 @INTERFACES.register('Alexa.PowerController')
 class AlexaPowerController(AlexaInterface):
@@ -166,7 +166,6 @@ class AlexaSceneController(AlexaInterface):
             'type': 'AlexaInterface',
             'interface': self.name(),
             'version': self.version(),
-            'proactivelyReported': self.propertiesProactivelyReported(),
             'supportsDeactivation': self.supportsDeactivation(),
         }
         return result
@@ -184,15 +183,24 @@ class AlexaColorController(AlexaInterface):
     def name(self):
         return 'Alexa.ColorController'
 
+    def propertiesSupported(self):
+        return [{'name': 'color'}]
+
 @INTERFACES.register('Alexa.ColorTemperatureController')
 class AlexaColorTemperatureController(AlexaInterface):
     def name(self):
         return 'Alexa.ColorTemperatureController'
 
+    def propertiesSupported(self):
+        return [{'name': 'colorTemperatureInKelvin'}]
+
 @INTERFACES.register('Alexa.PercentageController')
 class AlexaPercentageController(AlexaInterface):
     def name(self):
         return 'Alexa.PercentageController'
+
+    def propertiesSupported(self):
+        return [{'name': 'percentage'}]
 
 @INTERFACES.register('Alexa.Speaker')
 class AlexaSpeaker(AlexaInterface):
@@ -314,14 +322,10 @@ def api_error(request,
 
 def handle_message(handler, message):
     """Handle incoming API messages."""
-    #assert message[API_DIRECTIVE][API_HEADER]['payloadVersion'] == '3'
-
     # Read head data
     message = message[API_DIRECTIVE]
     namespace = message[API_HEADER]['namespace']
     name = message[API_HEADER]['name']
-
-    #entity_id = request[API_ENDPOINT]['endpointId'].replace('#', '.')
 
     return invoke(namespace, name, handler, message)
 
@@ -335,9 +339,8 @@ class AlexaSmartHomeCall(object):
         try:
             return operator.attrgetter(name)(self)(request)
         except Exception:
-            traceback.print_exc(file=sys.stdout)
-            return api_error(request)
-
+            _LOGGER.exception("Error during Alexa skill invocation for %s/%s", self.namespace, self.name)
+            return api_error(request, error_type='INTERNAL_ERROR', error_message="An unexpected error occurred while processing your request.")
 class Alexa(object):
 
     class Discovery(AlexaSmartHomeCall):
@@ -373,13 +376,31 @@ class Alexa(object):
             _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
             endpoint = self.handler.getEndpoint(request)
             endpoint.turnOn()
-            return api_message(request)
+            
+            # FIX: Return new state in context to prevent "No Response" error
+            properties = [{
+                'name': 'powerState',
+                'namespace': 'Alexa.PowerController',
+                'value': 'ON',
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
+            }]
+            return api_message(request, context={'properties': properties})
 
         def TurnOff(self, request):
             _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
             endpoint = self.handler.getEndpoint(request)
             endpoint.turnOff()
-            return api_message(request)
+            
+            # FIX: Return new state in context to prevent "No Response" error
+            properties = [{
+                'name': 'powerState',
+                'namespace': 'Alexa.PowerController',
+                'value': 'OFF',
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
+            }]
+            return api_message(request, context={'properties': properties})
 
     class BrightnessController(AlexaSmartHomeCall):
 
@@ -388,7 +409,9 @@ class Alexa(object):
             properties = [{
                 'name': 'brightness',
                 'namespace': 'Alexa.BrightnessController',
-                "value": brightness
+                "value": brightness,
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
             }]
             return api_message(request, context={'properties': properties})
 
@@ -406,7 +429,9 @@ class Alexa(object):
                         request[API_HEADER]['namespace'], request[API_HEADER]['name'],
                         brightness_delta)
             endpoint = self.handler.getEndpoint(request)
-            brightness = endpoint.getProperty('brightness') + brightness_delta
+            # Use optimistic calculation if possible or fetch current
+            current_brightness = endpoint.getProperty('brightness') or 50
+            brightness = current_brightness + brightness_delta
             return self.setbrightness(request, endpoint, brightness)
 
     class ColorController(AlexaSmartHomeCall):
@@ -419,7 +444,15 @@ class Alexa(object):
                         request[API_HEADER]['namespace'], request[API_HEADER]['name'])
             endpoint = self.handler.getEndpoint(request)
             endpoint.setColor(h,s,b)
-            return api_message(request)
+            
+            properties = [{
+                'name': 'color',
+                'namespace': 'Alexa.ColorController',
+                'value': request[API_PAYLOAD]['color'],
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
+            }]
+            return api_message(request, context={'properties': properties})
 
     class ColorTemperatureController(AlexaSmartHomeCall):
 
@@ -430,28 +463,23 @@ class Alexa(object):
                         kelvin)
             endpoint = self.handler.getEndpoint(request)
             endpoint.setColorTemperature(kelvin)
-            return api_message(request)
-
-        def DecreaseColorTemperature(self, request):
-            _LOGGER.debug("Request %s/%s",
-                        request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            kelvin = endpoint.getProperty('colorTemperature') - 500
-            endpoint.setColorTemperature(kelvin)
-            return api_message(request)
-
-        def IncreaseColorTemperature(self, request):
-            _LOGGER.debug("Request %s/%s",
-                        request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            kelvin = endpoint.getProperty('colorTemperature') + 500
-            endpoint.setColorTemperature(kelvin)
-            return api_message(request)
+            
+            properties = [{
+                'name': 'colorTemperatureInKelvin',
+                'namespace': 'Alexa.ColorTemperatureController',
+                'value': kelvin,
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
+            }]
+            return api_message(request, context={'properties': properties})
 
     class SceneController(AlexaSmartHomeCall):
 
         def Activate(self, request):
+            timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
             payload = {
                 'cause': {'type': 'VOICE_INTERACTION'},
-                'timestamp': '%sZ' % (datetime.utcnow().isoformat(),)
+                'timestamp': timestamp
             }
             _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
             endpoint = self.handler.getEndpoint(request)
@@ -461,9 +489,10 @@ class Alexa(object):
                 payload=payload)
 
         def Deactivate(self, request):
+            timestamp = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
             payload = {
                 'cause': {'type': 'VOICE_INTERACTION'},
-                'timestamp': '%sZ' % (datetime.utcnow().isoformat(),)
+                'timestamp': timestamp
             }
             _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
             endpoint = self.handler.getEndpoint(request)
@@ -476,12 +505,6 @@ class Alexa(object):
 
         def SetPercentage(self, request):
             percentage = int(request[API_PAYLOAD]['percentage'])
-            ##if entity.domain == fan.DOMAIN:
-            ##    service = fan.SERVICE_SET_SPEED
-            ##    speed = "off"
-            ##    if percentage <= 33:
-            ##        speed = "low"
-            ## ...
             _LOGGER.debug("Request %s/%s percentage %d", 
                         request[API_HEADER]['namespace'], request[API_HEADER]['name'],
                         percentage)
@@ -489,103 +512,58 @@ class Alexa(object):
             if   (percentage < 0):   percentage = 0
             elif (percentage > 100): percentage = 100
             endpoint.setPercentage(percentage)
-            return api_message(request)
-
-        def AdjustPercentage(self, request):
-            percentage_delta = int(request[API_PAYLOAD]['percentageDelta'])
-            _LOGGER.debug("Request %s/%s percentage_delta %d", 
-                        request[API_HEADER]['namespace'], request[API_HEADER]['name'],
-                        percentage_delta)
-            endpoint = self.handler.getEndpoint(request)
-            percentage = endpoint.getProperty(percentage)
-            target_percentage = int(percentage) + percentage_delta
-            if   (target_percentage < 0):   target_percentage = 0
-            elif (target_percentage > 100): target_percentage = 100
-            endpoint.setPercentage(percentage)
-            return api_message(request)
+            
+            properties = [{
+                'name': 'percentage',
+                'namespace': 'Alexa.PercentageController',
+                'value': percentage,
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
+            }]
+            return api_message(request, context={'properties': properties})
 
     class LockController(AlexaSmartHomeCall):
 
         def Lock(self, request):
-            # Alexa expects a lockState in the response
+            endpoint = self.handler.getEndpoint(request)
+            # Trigger actual lock command if endpoint supports it
+            if hasattr(endpoint, 'lock'): endpoint.lock()
+            
             properties = [{
                 'name': 'lockState',
                 'namespace': 'Alexa.LockController',
-                'value': 'LOCKED'
+                'value': 'LOCKED',
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
             }]
             _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
             return api_message(request, context={'properties': properties})
 
-        # Not supported by Alexa ...
         def Unlock(self, request):
+            endpoint = self.handler.getEndpoint(request)
+            if hasattr(endpoint, 'unlock'): endpoint.unlock()
+            
+            properties = [{
+                'name': 'lockState',
+                'namespace': 'Alexa.LockController',
+                'value': 'UNLOCKED',
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
+            }]
             _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-    class InputController(AlexaSmartHomeCall):
-
-        def SelectInput(self, request):
-            media_input = request[API_PAYLOAD]['input']
-            _LOGGER.debug("Request %s/%s media_input %s", request[API_HEADER]['namespace'], request[API_HEADER]['name',media_input])
-            return api_message(request)
-
-    class Speaker(AlexaSmartHomeCall):
-
-        def SetVolume(self, request):
-            volume = round(float(request[API_PAYLOAD]['volume'] / 100), 2)
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-        def AdjustVolume(self, request):
-            volume_delta = int(request[API_PAYLOAD]['volume'])
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-    class StepSpeaker(AlexaSmartHomeCall):
-
-        def AdjustVolume(self, request):
-            volume_step = request[API_PAYLOAD]['volumeSteps']
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-        def SetMute(self, request):
-            mute = bool(request[API_PAYLOAD]['mute'])
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-    class PlaybackController(AlexaSmartHomeCall):
-
-        def Play(self, request):
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-        def Pause(self, request):
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-        def Stop(self, request):
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-        def Next(self, request):
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
-
-        def Previous(self, request):
-            _LOGGER.debug("Request %s/%s", request[API_HEADER]['namespace'], request[API_HEADER]['name'])
-            return api_message(request)
+            return api_message(request, context={'properties': properties})
 
     class ThermostatController(AlexaSmartHomeCall):
 
         def SetTargetTemperature(self, request):
-            temp = 20.0
             tempScale = "CELSIUS"
-            #unit = entity.attributes[CONF_UNIT_OF_MEASUREMENT]
             payload = request[API_PAYLOAD]
+            endpoint = self.handler.getEndpoint(request)
+            
             if 'targetSetpoint' in payload:
                 temp = temperature_from_object(payload['targetSetpoint'])
                 _LOGGER.debug("Request %s/%s targetSetpoint %.2f",
                             request[API_HEADER]['namespace'], request[API_HEADER]['name'], temp)
-                endpoint = self.handler.getEndpoint(request)
                 endpoint.setTargetSetPoint(temp)
 
             properties = [{
@@ -594,31 +572,9 @@ class Alexa(object):
                 "value": {
                     "value": temp,
                     "scale": tempScale
-                }
-            }]
-            return api_message(request, context={'properties': properties})
-
-        def AdjustTargetTemperature(self, request):
-            temp = 20.0
-            tempScale = "CELSIUS"
-            ##unit = entity.attributes[CONF_UNIT_OF_MEASUREMENT]
-            temp_delta = temperature_from_object(request[API_PAYLOAD]['targetSetpointDelta'])
-
-            _LOGGER.debug("Request %s/%s targetSetpoint temp_delta %.2f", 
-                        request[API_HEADER]['namespace'], request[API_HEADER]['name'], temp_delta)
-
-            endpoint = self.handler.getEndpoint(request)
-            temp = endpoint.getProperty('targetSetpoint')['value']
-            target_temp = temp + temp_delta
-            endpoint.setTargetSetPoint(target_temp)
-
-            properties = [{
-                'name': 'targetSetpoint',
-                'namespace': 'Alexa.ThermostatController',
-                "value": {
-                    "value": target_temp,
-                    "scale": tempScale
-                }
+                },
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
             }]
             return api_message(request, context={'properties': properties})
 
@@ -632,9 +588,11 @@ class Alexa(object):
             endpoint = self.handler.getEndpoint(request)
             endpoint.setThermostatMode(mode)
             properties = [{
-                'name': 'targetSetthermostatModepoint',
+                'name': 'thermostatMode',
                 'namespace': 'Alexa.ThermostatController',
-                "value": mode
+                "value": mode,
+                'timeOfSample': datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+                'uncertaintyInMilliseconds': 0
             }]
             return api_message(request, context={'properties': properties})
 
@@ -643,6 +601,10 @@ class Alexa(object):
         def ReportState(self, request):
             properties = []
             endpoint = self.handler.getEndpoint(request)
+            if not endpoint or endpoint.getDevice() is None:
+                _LOGGER.error("ReportState failed: Could not fetch device state for %s", request['endpoint']['endpointId'])
+                return api_error(request, error_type='ENDPOINT_UNREACHABLE', error_message="Could not connect to Domoticz")
+
             for interface in endpoint.capabilities():
                 properties.extend(interface.serializeProperties())
 
@@ -664,25 +626,14 @@ def invoke(namespace, name, handler, request):
         return obj.invoke(name, request)
 
     except Exception:
-        _LOGGER.error("Can't process %s/%s", namespace, name)
-        return api_error(request, error_type='INTERNAL_ERROR')
-
-def fahrenheit_to_celsius(fahrenheit: float, interval: bool = False) -> float:
-    if interval:
-        return fahrenheit / 1.8
-    return (fahrenheit - 32.0) / 1.8
-
-def celsius_to_fahrenheit(celsius: float, interval: bool = False) -> float:
-    if interval:
-        return celsius * 1.8
-    return celsius * 1.8 + 32.0
+        _LOGGER.exception("Error processing Alexa directive for %s/%s", namespace, name)
+        return api_error(request, error_type='INTERNAL_ERROR', error_message="An unexpected error occurred while processing your directive.")
 
 def temperature_from_object(temp_obj):
     """Get temperature from Temperature object in requested unit."""
     temp = float(temp_obj['value'])
     if temp_obj['scale'] == 'FAHRENHEIT':
-        temp = fahrenheit_to_celsius(temp)
+        temp = (temp - 32.0) / 1.8
     elif temp_obj['scale'] == 'KELVIN':
-        if not interval:
-            temp -= 273.15
+        temp -= 273.15
     return temp

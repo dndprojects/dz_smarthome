@@ -23,10 +23,11 @@ class Configuration(object):
         opts['planID'] = self.get(['planID'], default=None)
         opts['prefixName'] = self.get(['prefixName'], default=None)
         opts['debug'] = self.get(['debug'], default=False)
+        opts['skillName'] = self.get(['skillName'], default='AlexiczSkill')
         self.opts = opts
 
     def __getattr__(self, name):
-        return self.opts[name]
+        return self.opts.get(name)
 
     def get(self, keys, default):
         for key in keys:
@@ -38,6 +39,7 @@ class Configuration(object):
         return json.dumps(self.opts, indent=2, separators=(',', ': '))
 
 def event_handler(request, context):
+    logger.warning('Executing Alexicz lambda handler version V3')
     config = Configuration('configdz.json')
     if config.debug:
         logger.setLevel(logging.DEBUG)

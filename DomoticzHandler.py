@@ -1,564 +1,350 @@
-import os, json, urllib, ssl, base64
+import json, ssl, base64, math, colorsys, logging, re
 from urllib.request import urlopen, Request
-import re
 from AlexaSmartHome import *
 
-import math, colorsys
-import logging
-
-SKILL_NAME = 'Alexicz'
-
+_LOGGER = logging.getLogger(__name__)
 ENDPOINT_ADAPTERS = Registry()
 
-_LOGGER = logging.getLogger(__name__)
+# ======================================================
+# Base Endpoint
+# ======================================================
 
 class DomoticzEndpoint(AlexaEndpoint):
-
-    _device_ = None
-    def getDevice(self):
-        if self._device_ is None:
-            self._device_ = self.handler.getDevice(self._endpointId)
-        return self._device_
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.handler = None
+        self._device = None
 
     def setHandler(self, handler):
         self.handler = handler
-    
+
+    def getDevice(self):
+        if not self._device and self.handler:
+            self._device = self.handler.getDevice(self.endpointId())
+        return self._device
+
+    # ---------------- Alexa Properties ----------------
+
     def getProperty(self, name):
-        #device = self.handler.getDevice(self._endpointId)
-        device = self.getDevice()
-        if   name == 'powerState':
-            if device['Status'] == 'On':
-                return 'ON'
-            else:
-                return 'OFF'
-        elif name == 'lockState':
-            if device['Status'] == 'On':
-                return 'LOCKED'
-            else:
-                return 'UNLOCKED'
-            return 'JAMMED'
-        elif name == 'brightness':
-            level = device['Level']
-            maxLevel = device['MaxDimLevel']
-            return int((float(level) * 100) / float(maxLevel))
-            #return round(self.entity.attributes['brightness'] / 255.0 * 100)
-        elif name == 'percentage':
-            level = device['Level']
-            maxLevel = device['MaxDimLevel']
-            return int((float(level) * 100) / float(maxLevel))
-        elif name == 'colorTemperature':
-            level = device['Level']
-            maxLevel = device['MaxDimLevel']
-            # Value to be returned 1000 to 10.000
-            return 1000 + 9000 * (float(level) / float(maxLevel))
-        elif name == 'temperature':
-            if isinstance(self, ThermostatAlexaEndpoint):
-                temp = device['SetPoint']
-            else:
-                temp = device['Temp']
-            return {
-                'value': float(temp),
-                'scale': 'CELSIUS',
-            }
-        elif name == 'targetSetpoint':
-            setPoint = device['SetPoint']
-            return {
-                'value': float(setPoint),
-                'scale': 'CELSIUS',
-            }
-        elif name == 'thermostatMode':
-            if isinstance(self, SelectorThermostatAlexaEndpoint):
-                ilevel = int(device['Level']/device['LevelInt'])
-                levels = device['LevelNames'].split("|")
-                mode = levels[ilevel].upper()
-                return mode
-        elif name == 'detectionState':
-            if device['Status'] == 'Closed':
-                return 'NOT_DETECTED'
-            else:
-                return 'DETECTED'
-            return 'JAMMED'
+        d = self.getDevice()
+        if not d:
+            return None
+
+        if name == 'powerState':
+            status = d.get('Status', 'Off')
+            return 'ON' if (status in ('On', 'Open') or status.startswith('Set Level')) else 'OFF'
+
+        if name == 'color':
+            color_json = d.get('Color', '{}')
+            try:
+                c = json.loads(color_json)
+                r, g, b = c.get('r', 0), c.get('g', 0), c.get('b', 0)
+                h, s, v = colorsys.rgb_to_hsv(r/255.0, g/255.0, b/255.0)
+                return {'hue': h*360.0, 'saturation': s, 'brightness': v}
+            except Exception:
+                # Fallback if color parsing fails
+                return None
+
+        if name in ('brightness', 'percentage'):
+            return int(d.get('Level', 0))
+
+        if name == 'temperature':
+            t = d.get('Temp')
+            if t is None:
+                return None
+            return {'value': float(t), 'scale': 'CELSIUS'}
+
+        if name == 'targetSetpoint':
+            sp = d.get('SetPoint')
+            if sp is None:
+                return None
+            return {'value': float(sp), 'scale': 'CELSIUS'}
+
+        if name == 'thermostatMode':
+            names = d.get('LevelNames', '').split('|')
+            try:
+                idx = int(d.get('Level', 0) / d.get('LevelInt', 10))
+                return names[idx].upper()
+            except Exception:
+                return 'AUTO'
+
+        if name == 'detectionState':
+            return 'DETECTED' if d.get('Status') == 'Open' else 'NOT_DETECTED'
+
         return None
 
-class OnOffAlexaEndpoint(DomoticzEndpoint):
 
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        super().__init__(endpointId, friendlyName, description, manufacturerName)
-        self.addCapability(AlexaPowerController(self, 'Alexa.PowerController',[{'name': 'powerState'}]))
-
-    def turnOn(self):
-        self.handler.setSwitch(self._endpointId, 'On')
-
-    def turnOff(self):
-        self.handler.setSwitch(self._endpointId, 'Off')
-
-@ENDPOINT_ADAPTERS.register('Scene')
-class SceneAlexaEndpoint(DomoticzEndpoint):
-
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        super().__init__(endpointId, friendlyName, description, manufacturerName)
-        self.addCapability(AlexaSceneController(self, 'Alexa.AlexaSceneController', deactivationSupported=False))
-
-    def activate(self):
-        self.handler.setSceneSwitch(self._endpointId, 'On')
-
-    def deactivate(self):
-        self.handler.setSceneSwitch(self._endpointId, 'Off')
-
-@ENDPOINT_ADAPTERS.register('Group')
-class GroupAlexaEndpoint(SceneAlexaEndpoint):
-
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        super().__init__(endpointId, friendlyName, description, manufacturerName)
-        self.addCapability(AlexaSceneController(self, 'Alexa.AlexaSceneController', deactivationSupported=True))
+# ======================================================
+# Endpoints
+# ======================================================
 
 @ENDPOINT_ADAPTERS.register('SwitchLight')
-class SwitchLightAlexaEndpoint(OnOffAlexaEndpoint):
+class SwitchLightEndpoint(DomoticzEndpoint):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.addCapability(AlexaPowerController(self))
+        self.addCapability(AlexaBrightnessController(self))
 
-    def setPercentage(self, percentage):
-        self.handler.setLevel(self._endpointId, percentage)
+    def turnOn(self):
+        self.handler.setSwitch(self.idx, 'On')
 
-    def setBrightness(self, brightness):
-        self.handler.setLevel(self._endpointId, brightness)
+    def turnOff(self):
+        self.handler.setSwitch(self.idx, 'Off')
 
-    def setColor(self, hue, saturation, brigthness):
-        rgb = color_hsb_to_RGB(hue, saturation, brigthness)
-        device = self.getDevice()
-        self.handler.setColor(self._endpointId, rgb, device['Level'])
+    def setBrightness(self, value):
+        self.handler.setLevel(self.idx, value)
+
+    def setColor(self, h, s, b):
+        r, g, b_val = [int(x*255) for x in colorsys.hsv_to_rgb(h/360.0, s, b/100.0)]
+        self.handler.setColor(self.idx, r, g, b_val)
 
     def setColorTemperature(self, kelvin):
-        rgb = convert_K_to_RGB(kelvin)
-        device = self.getDevice()
-        self.handler.setColor(self._endpointId, rgb, device['Level'])
+        self.handler.setColorTemperature(self.idx, kelvin)
+
 
 @ENDPOINT_ADAPTERS.register('Blind')
-class BlindAlexaEndpoint(OnOffAlexaEndpoint):
+class BlindEndpoint(DomoticzEndpoint):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.addCapability(AlexaPowerController(self))
+        self.addCapability(AlexaPercentageController(self))
 
     def turnOn(self):
-        self.handler.setSwitch(self._endpointId, 'Off')
+        self.handler.setSwitch(self.idx, 'Off')
 
     def turnOff(self):
-        self.handler.setSwitch(self._endpointId, 'On')
+        self.handler.setSwitch(self.idx, 'On')
 
-    def setPercentage(self, percentage):
-        self.handler.setLevel(self._endpointId, percentage)
+    def setPercentage(self, value):
+        self.handler.setLevel(self.idx, value)
 
-@ENDPOINT_ADAPTERS.register('RFY')
-class RFYAlexaEndpoint(OnOffAlexaEndpoint):
-
-    def turnOn(self):
-        self.handler.setSwitch(self._endpointId, 'Off')
-
-    def turnOff(self):
-        self.handler.setSwitch(self._endpointId, 'On')
-
-    def setPercentage(self, percentage):
-        self.handler.setLevel(self._endpointId, percentage)
-
-class LockableAlexaEndpoint(DomoticzEndpoint):
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        super().__init__(endpointId, friendlyName, description, manufacturerName)
-        self.addCapability(AlexaLockController(self, 'Alexa.LockController',[{'name': 'lockState'}]))              
-
-@ENDPOINT_ADAPTERS.register('Lock')
-class LockAlexaEndpoint(LockableAlexaEndpoint):
-    pass
-
-@ENDPOINT_ADAPTERS.register('Contact')
-class ContactAlexaEndpoint(DomoticzEndpoint):
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        super().__init__(endpointId, friendlyName, description, manufacturerName)
-        self.addCapability(AlexaContactSensor(self, 'Alexa.ContactSensor',[{'name': 'detectionState'}]))
 
 @ENDPOINT_ADAPTERS.register('TemperatureSensor')
-class TemperatureSensorAlexaEndpoint(DomoticzEndpoint):
+class TemperatureSensorEndpoint(DomoticzEndpoint):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.addCapability(AlexaTemperatureSensor(self))
+        self.addDisplayCategories("TEMPERATURE_SENSOR")
 
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        super().__init__(endpointId, friendlyName, description, manufacturerName)
-        self.addCapability(AlexaTemperatureSensor(self, 'Alexa.TemperatureSensor',[{'name': 'temperature'}]))
-
-    def setTargetSetPoint(self, targetSetPoint):
-        pass
-
-    def setThermostatMode(self, mode):
-        pass
 
 @ENDPOINT_ADAPTERS.register('Thermostat')
-class ThermostatAlexaEndpoint(DomoticzEndpoint):
+class ThermostatEndpoint(DomoticzEndpoint):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.addCapability(AlexaTemperatureSensor(self))
+        tc = AlexaThermostatController(
+            self,
+            properties=[{'name': 'targetSetpoint'}, {'name': 'thermostatMode'}]
+        )
+        tc.setModesSupported(['HEAT', 'COOL', 'AUTO', 'OFF'])
+        self.addCapability(tc)
+        self.addDisplayCategories("THERMOSTAT")
 
-    def __init__(self, endpointId, friendlyName="", description="", manufacturerName=""):
-        super().__init__(endpointId, friendlyName, description, manufacturerName)
-        self.addCapability(AlexaTemperatureSensor(self, 'Alexa.TemperatureSensor',[{'name': 'temperature'}]))
-        thermostatCapability = AlexaThermostatController(self, 'Alexa.ThermostatController',[{'name': 'targetSetpoint'}, {'name': 'thermostatMode'}])
-        thermostatCapability.setModesSupported(["HEAT","COOL","AUTO","ECO","OFF"])
-        self.addCapability(thermostatCapability)
-
-    def setTargetSetPoint(self, targetSetPoint):
-        self.handler.setTemp(self._endpointId, targetSetPoint)
-
-    def setThermostatMode(self, mode):
-        pass
-
-@ENDPOINT_ADAPTERS.register('SelectorThermostat')
-class SelectorThermostatAlexaEndpoint(DomoticzEndpoint):
-
-    def setTargetSetPoint(self, targetSetPoint):
-        #self.handler.setTemp(self._endpointId, targetSetPoint)
-        pass
+    def setTargetSetPoint(self, value):
+        self.handler.setSetpoint(self.idx, value)
 
     def setThermostatMode(self, mode):
-        self.handler.setLevelByName(self._endpointId, mode)
+        self.handler.setLevelByName(self.idx, mode)
 
-class Domoticz(object):
 
-    def __init__(self,url,username=None,password=None):
-        self.url = os.path.join(url, '')
+@ENDPOINT_ADAPTERS.register('Scene')
+class SceneEndpoint(DomoticzEndpoint):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.addCapability(AlexaSceneController(self))
+        self.addDisplayCategories("SCENE")
 
-        if url.startswith("https"):
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            httpsHandler = urllib.request.HTTPSHandler(context = context)
-            opener = urllib.request.build_opener(httpsHandler)
-            urllib.request.install_opener(opener)
+    def activate(self):
+        self.handler.setScene(self.idx, 'On')
 
-        self.authorization = None
-        if username is not None:
-            credentials = '%s:%s' % (username, password)
-            encoded_credentials = base64.b64encode(credentials.encode())
-            self.authorization = b'Basic ' + encoded_credentials
+    def deactivate(self):
+        self.handler.setScene(self.idx, 'Off')
 
-        self.planID = -1
-        self.includeScenesGroups = False
-        self.prefixName = None
+
+# ======================================================
+# Domoticz Handler
+# ======================================================
+
+class Domoticz:
+    def __init__(self, url, username=None, password=None):
+        self.url = url.rstrip('/')
+        self.auth = None
+        self.devices = {}
         self.config = None
 
+        if username:
+            token = base64.b64encode(f"{username}:{password}".encode()).decode()
+            self.auth = f"Basic {token}"
+
+        if self.url.startswith("https"):
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ssl._create_default_https_context = lambda: ctx
+
     def configure(self, config):
-        self.includeScenesGroups = config.includeScenesGroups
-        self.planID = config.planID
-        self.prefixName = config.prefixName
         self.config = config
 
+    # ---------------- API ----------------
+
     def api(self, query):
-        url = self.url + "json.htm?" + query
-        print("Domoticz API call %s", url)
-        _LOGGER.debug("Domoticz API call %s", url)
-        headers = { 'Content-Type': 'application/json' }
-        if self.authorization is not None:
-            headers['Authorization'] = self.authorization
-        payload = urlopen(Request(url, None, headers)).read()
-        return json.loads(payload.decode('utf-8'))
+        url = f"{self.url}/json.htm?{query}"
+        headers = {'Content-Type': 'application/json'}
+        if self.auth:
+            headers['Authorization'] = self.auth
+
+        try:
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=5) as r:
+                return json.loads(r.read().decode())
+        except Exception as e:
+            _LOGGER.error(f"Domoticz API error: {e}")
+            return {}
+
+    # ---------------- Load ----------------
+
+    def loadDevices(self):
+        res = self.api("type=command&param=getdevices&filter=all&used=true")
+        self.devices = {str(d['idx']): d for d in res.get('result', [])}
+
+        if self.config and getattr(self.config, 'includeScenesGroups', False):
+            res = self.api("type=command&param=getscenes")
+            for d in res.get('result', []):
+                self.devices[str(d['idx'])] = d
+
+    # ---------------- Alexa ----------------
 
     def getEndpoint(self, request):
+        """
+        Called by AlexaSmartHome for EVERY directive
+        (TurnOn, TurnOff, SetBrightness, etc.)
+        """
         endpointId = request['endpoint']['endpointId']
-        items = endpointId.split("-")
-        className = items[0]
-        id = items[1]
-        endpoint = ENDPOINT_ADAPTERS[className](id)
-        if className == 'SwitchLight':
-            endpoint.addCapability(AlexaPercentageController(endpoint, 'Alexa.PercentageController',[{'name': 'percentage'}]))
-            endpoint.addCapability(AlexaBrightnessController(endpoint, 'Alexa.BrightnessController',[{'name': 'brightness'}]))
-            endpoint.addCapability(AlexaColorController(endpoint, 'Alexa.ColorController'))
-            endpoint.addCapability(AlexaColorTemperatureController(endpoint, 'Alexa.ColorTemperatureController'))
-        elif className == 'Blind' or className == 'RFY':
-            endpoint.addCapability(AlexaPercentageController(endpoint, 'Alexa.PercentageController',[{'name': 'percentage'}]))
-        cookies = request['endpoint']['cookie']
-        if cookies is not None:
-            endpoint.addCookie(cookies)
+        prefix, idx = endpointId.split("-", 1)
+
+        if prefix not in ENDPOINT_ADAPTERS:
+            raise Exception(f"Unknown endpoint type {prefix}")
+
+        # Create endpoint instance dynamically
+        endpoint = ENDPOINT_ADAPTERS[prefix](
+            endpointId,
+            request['endpoint'].get('friendlyName', ''),
+            '',
+            'Domoticz'
+        )
+
+        endpoint.idx = idx
         endpoint.setHandler(self)
+
+        # Attach cached device
+        device = self.devices.get(idx)
+        if device:
+            endpoint._device = device
+
         return endpoint
 
+    def getDevice(self, endpointId):
+        parts = endpointId.split("-")
+        idx = parts[-1]
+        
+        # Return cached if available
+        if idx in self.devices:
+            return self.devices[idx]
+
+        # Not in cache? Fetch it from Domoticz
+        prefix = parts[0]
+        if prefix == 'Scene':
+            res = self.api("type=command&param=getscenes")
+            for d in res.get('result', []):
+                self.devices[str(d['idx'])] = d
+        else:
+            res = self.api(f"type=command&param=getdevices&rid={idx}")
+            if res.get('result'):
+                self.devices[idx] = res['result'][0]
+        
+        return self.devices.get(idx)
+
     def getEndpoints(self):
-        endpoints = []
+        self.loadDevices()
+        eps = []
 
-        # Devices
-        response = self.api('type=devices&used=true')
-        devices= response['result']
-        for device in devices:
-            endpoint = None
+        for idx, d in self.devices.items():
+            name = d.get('Name', f"Device {idx}")
+            desc = d.get('Description', '')
+            if desc:
+                match = re.search(r'Alexa_Name:\s*([^\n\r]*)', desc, re.IGNORECASE)
+                if match:
+                    name = match.group(1).strip()
+            devType = d.get('Type', '')
 
-            if (device['PlanID'] == "0" or device['PlanID'] == ""): continue
-            if (self.planID >= 0 and (not (self.planID in device['PlanIDs']))): continue
+            if devType in ('Scene', 'Group'):
+                ep = SceneEndpoint(f"Scene-{idx}", name, devType, "Domoticz")
 
-            devType = device['Type']
+            elif 'Temp' in devType:
+                ep = TemperatureSensorEndpoint(
+                    f"TemperatureSensor-{idx}", name, devType, "Domoticz"
+                )
 
-            friendlyName = device['Name']
-            # philchillbill note
-            if friendlyName.startswith("$"):
-                friendlyName=friendlyName[1:]            
-            endpointId = device['idx']
-            manufacturerName = device['HardwareName']
-            description = devType
+            elif 'Thermostat' in devType:
+                ep = ThermostatEndpoint(
+                    f"Thermostat-{idx}", name, devType, "Domoticz"
+                )
 
-            matchObj = re.match( r'.*Alexa_Name:\s*([^\n]*)', device['Description'], re.M|re.I|re.DOTALL)
-            if matchObj:  friendlyName = matchObj.group(1)
-            matchObj = re.match( r'.*Alexa_Description:\s*([^\n]*)', device['Description'], re.M|re.I|re.DOTALL)
-            if matchObj:  description = matchObj.group(1)
-            extra = None
-            matchObj = re.match( r'.*Alexa_extra:\s*([^\n]*)', device['Description'], re.M|re.I|re.DOTALL)
-            if matchObj:  extra = matchObj.group(1)
+            elif 'Blind' in devType or 'RFY' in devType:
+                ep = BlindEndpoint(
+                    f"Blind-{idx}", name, devType, "Domoticz"
+                )
 
-            if self.prefixName is not None:
-                #friendlyName = self.prefixName + friendlyName
-                description = self.prefixName + description
+            else:
+                ep = SwitchLightEndpoint(
+                    f"SwitchLight-{idx}", name, devType, "Domoticz"
+                )
+                # Add color capabilities if device supports it
+                subType = d.get('SubType', '')
+                if 'RGB' in subType or 'Color' in devType:
+                    ep.addCapability(AlexaColorController(ep))
+                    ep.addCapability(AlexaColorTemperatureController(ep))
+                ep.addDisplayCategories("LIGHT")
 
-            if (devType.startswith('Lighting') or devType.startswith('Color Switch')):
-                switchType = device['SwitchType']
-                if switchType == 'On/Off':
-                    # Usual switch case
-                    endpoint = SwitchLightAlexaEndpoint("SwitchLight-"+endpointId, friendlyName, description, manufacturerName)
-                    endpoint.addDisplayCategories("SWITCH")
-                    hasDimmer = deviceHasDimmer(device)
-                    if (hasDimmer):
-                        endpoint.addCapability(AlexaPercentageController(self, 'Alexa.PercentageController',[{'name': 'percentage'}]))
-                        endpoint.addCapability(AlexaBrightnessController(self, 'Alexa.BrightnessController',[{'name': 'brightness'}]))
-                else:
-                    # Usual switch case
-                    endpoint = SwitchLightAlexaEndpoint("SwitchLight-"+endpointId, friendlyName, description, manufacturerName)
-                    endpoint.addDisplayCategories("LIGHT")
-                    hasDimmer = deviceHasDimmer(device)
-                    if (hasDimmer):
-                        endpoint.addCapability(AlexaPercentageController(self, 'Alexa.PercentageController',[{'name': 'percentage'}]))
-                        endpoint.addCapability(AlexaBrightnessController(self, 'Alexa.BrightnessController',[{'name': 'brightness'}]))              
-                    subType = device['SubType']
-                    if (subType.startswith("RGB")):
-                        endpoint.addCapability(AlexaColorController(self, 'Alexa.ColorController'))              
-                        endpoint.addCapability(AlexaColorTemperatureController(self, 'Alexa.ColorTemperatureController'))
+            ep.idx = idx
+            ep.setHandler(self)
+            eps.append(ep)
 
-            elif (devType.startswith('Light/Switch')):
-                switchType = device['SwitchType']
-                # Special case to implement a "virtual thermostat"
-                if switchType == 'Selector' and (extra is not None):
-                    # extra must contain { "OFF": 0, CONFORT": idx, "ECONOMIE"; idx...}
-                    endpoint = ThermostatAlexaEndpoint("SelectorThermostat-"+endpointId, friendlyName, description, manufacturerName)
-                    endpoint.addDisplayCategories("THERMOSTAT")
-                elif (switchType.startswith('Door')):
-                    endpoint = LockAlexaEndpoint("Lock-"+endpointId, friendlyName, description, manufacturerName)
-                    endpoint.addDisplayCategories("SWITCH")
-                elif (switchType.startswith('Contact') or switchType.startswith('Motion Sensor')):
-                    endpoint = ContactAlexaEndpoint("Contact-"+endpointId, friendlyName, description, manufacturerName)
-                    endpoint.addDisplayCategories("CONTACT_SENSOR")
-                else:
-                    # Usual switch case
-                    endpoint = SwitchLightAlexaEndpoint("SwitchLight-"+endpointId, friendlyName, description, manufacturerName)
-                    endpoint.addDisplayCategories("SWITCH")
-                    hasDimmer = deviceHasDimmer(device)
-                    if (hasDimmer):
-                        endpoint.addCapability(AlexaPercentageController(self, 'Alexa.PercentageController',[{'name': 'percentage'}]))
-                        endpoint.addCapability(AlexaBrightnessController(self, 'Alexa.BrightnessController',[{'name': 'brightness'}]))              
-                    subType = device['SubType']
-                    if (subType.startswith("RGB")):
-                        endpoint.addDisplayCategories("LIGHT")
-                        endpoint.addCapability(AlexaColorController(self, 'Alexa.ColorController'))              
-                        endpoint.addCapability(AlexaColorTemperatureController(self, 'Alexa.ColorTemperatureController')) 						
+        _LOGGER.warning(f"Alexa Discovery endpoints: {len(eps)}")
+        return eps
 
-            elif (devType.startswith('Blind') or devType.startswith('RFY')):
-                if   devType.startswith('Blind'): endpoint = BlindAlexaEndpoint("Blind-"+endpointId, friendlyName, description, manufacturerName)
-                elif devType.startswith('RFY'):   endpoint = RFYAlexaEndpoint("RFY-"+endpointId, friendlyName, description, manufacturerName)
-                endpoint.addDisplayCategories("SWITCH")
-                hasDimmer = deviceHasDimmer(device)
-                if (hasDimmer):
-                    endpoint.addCapability(AlexaPercentageController(self, 'Alexa.PercentageController',[{'name': 'percentage'}]))
+    # ---------------- Actions ----------------
 
-            elif (devType.startswith('Lock')):
-                endpoint = LockAlexaEndpoint("Lock-"+endpointId, friendlyName, description, manufacturerName)
-                endpoint.addDisplayCategories("SWITCH")
-
-            elif (devType.startswith('Contact')):
-                endpoint = ContactAlexaEndpoint("Contact-"+endpointId, friendlyName, description, manufacturerName)
-                endpoint.addDisplayCategories("CONTACT_SENSOR")
-
-            elif (devType.startswith('Temp')):
-                endpoint = TemperatureSensorAlexaEndpoint("TemperatureSensor-"+endpointId, friendlyName, description, manufacturerName)
-                endpoint.addDisplayCategories("TEMPERATURE_SENSOR")
-
-            elif (devType.startswith('Therm')):
-                endpoint = ThermostatAlexaEndpoint("Thermostat-"+endpointId, friendlyName, description, manufacturerName)
-                endpoint.addDisplayCategories("THERMOSTAT")
-                endpoint.addDisplayCategories("TEMPERATURE_SENSOR")
-
-            if (endpoint is not None):
-                if extra is not None:
-                    endpoint.addCookie({ "extra": extra} )
-                #print(endpoint.displayCategories())
-                endpoints.append(endpoint)
-
-        # Scenes/Groups
-        if self.includeScenesGroups:
-            response = self.api('type=scenes')
-            scenes= response['result']
-            for scene in scenes:
-                endpoint = None
-
-                sceneType = scene['Type']
-                friendlyName = scene['Name']
-                endpointId = scene['idx']
-                manufacturerName = SKILL_NAME
-                description = sceneType
-
-                matchObj = re.match( r'.*Alexa_Name:\s*([^\n]*)', scene['Description'], re.M|re.I|re.DOTALL)
-                if matchObj:  friendlyName = matchObj.group(1)
-                matchObj = re.match( r'.*Alexa_Description:\s*([^\n]*)', scene['Description'], re.M|re.I|re.DOTALL)
-                if matchObj:  description = matchObj.group(1)
-                extra = None
-                matchObj = re.match( r'.*Alexa_extra:\s*([^\n]*)', scene['Description'], re.M|re.I|re.DOTALL)
-                if matchObj:  extra = matchObj.group(1)
-
-                if self.prefixName is not None:
-                    friendlyName = self.prefixName + friendlyName
-
-                if (sceneType.startswith('Scene') or sceneType.startswith('Group')):
-                    if sceneType.startswith('Scene')  : 
-                        endpoint = SceneAlexaEndpoint('Scene-'+endpointId, friendlyName, description, manufacturerName)
-                        endpoint.addDisplayCategories("SCENE_TRIGGER")
-                    elif sceneType.startswith('Group'): 
-                        endpoint = GroupAlexaEndpoint('Group-'+endpointId, friendlyName, description, manufacturerName)
-                        endpoint.addDisplayCategories("SCENE_TRIGGER")
-
-                if (endpoint is not None):
-                    if extra is not None:
-                        endpoint.addCookie({ "extra": extra} )
-                    endpoints.append(endpoint)
-
-        return endpoints
-
-    #
-    #  Domoticz API
-    #
-    def getDevice(self, idx):
-        return self.api('type=devices&rid=%s'%idx)['result'][0]
-
-    def setTemp(self, idx, value):
-        # Ignore exception ???
-        try:
-            self.api('type=command&param=udevice&idx=%s&nvalue=0&svalue=%s'%(idx,value))
-        except Exception:
-            pass
+    def setSwitch(self, idx, cmd):
+        self.api(f"type=command&param=switchlight&idx={idx}&switchcmd={cmd}")
 
     def setLevel(self, idx, level):
-        self.api('type=command&param=switchlight&idx=%s&switchcmd=Set%%20Level&level=%s'%(idx,level))
+        self.api(
+            f"type=command&param=switchlight&idx={idx}&switchcmd=Set%20Level&level={level}"
+        )
 
-    def setLevelByName(self, idx, levelName):
-        device = self.getDevice(idx)
-        levels = device['LevelNames'].upper().split("|")
-        ilevel = levels.index(levelName.upper())
-        self.setLevel(idx,ilevel*int(device['LevelInt']))
+    def setColor(self, idx, r, g, b):
+        self.api(f"type=command&param=setcolbrightnessvalue&idx={idx}&r={r}&g={g}&b={b}&brightness=100")
 
-    def setColor(self, idx, rgb, brightness):
-        #self.api('type=command&param=setcolbrightnessvalue&idx=%s&hex=%s&brightness=%s&iswhite=false'%(idx,hue,brightness))
-        self.api('type=command&param=setcolbrightnessvalue&idx=%s&hex=%0.2X%0.2X%0.2X&brightness=%s&iswhite=false'%(idx,rgb[0],rgb[1],rgb[2],brightness))
-        #self.api('type=command&param=setcolbrightnessvalue&idx=%s&color={"m":3,"r":%s,"g":%s,"b":%s}&brightness=%s'%(idx,rgb[0],rgb[1],rgb[2],brightness))
+    def setColorTemperature(self, idx, kelvin):
+        # Map Kelvin (2000-6500) to Domoticz level (0-100)
+        level = int((kelvin - 2000) / (6500 - 2000) * 100)
+        level = max(0, min(100, level))
+        self.api(f"type=command&param=setcolbrightnessvalue&idx={idx}&color={{\"m\":3,\"t\":{level}}}")
 
-    def setKelvinLevel(self, idx, kelvin):
-        self.api('type=command&param=setkelvinlevel&idx=%s&kelvin=%s'%(idx,kelvin))
+    def setSetpoint(self, idx, value):
+        self.api(
+            f"type=command&param=setsetpoint&idx={idx}&setpoint={value}"
+        )
 
-    def setSwitch(self, idx, value):
-        self.api('type=command&param=switchlight&idx=%s&switchcmd=%s'%(idx,value))
+    def setLevelByName(self, idx, name):
+        d = self.devices.get(str(idx))
+        names = d.get('LevelNames', '').split('|')
+        if name.upper() in [n.upper() for n in names]:
+            lvl = names.index(name.upper()) * d.get('LevelInt', 10)
+            self.setLevel(idx, lvl)
 
-    def setSceneSwitch(self, idx, value):
-        self.api('type=command&param=switchscene&idx=%s&switchcmd=%s'%(idx,value))
-
-# philchillbill comment
-def deviceHasDimmer(device):
-    #return (device['HaveDimmer'] and (device['DimmerType'] != 'none')) or device['SwitchType'].endswith('Percentage')
-    return device['HaveDimmer']
-
-def color_hsb_to_RGB(fH: float, fS: float, fB: float) -> Tuple[int, int, int]:
-    """Convert a hsb into its rgb representation."""
-    if fS == 0:
-        fV = int(fB * 255)
-        return fV, fV, fV
-
-    r = g = b = 0
-    h = fH / 60
-    f = h - float(math.floor(h))
-    p = fB * (1 - fS)
-    q = fB * (1 - fS * f)
-    t = fB * (1 - (fS * (1 - f)))
-
-    if int(h) == 0:
-        r = int(fB * 255)
-        g = int(t * 255)
-        b = int(p * 255)
-    elif int(h) == 1:
-        r = int(q * 255)
-        g = int(fB * 255)
-        b = int(p * 255)
-    elif int(h) == 2:
-        r = int(p * 255)
-        g = int(fB * 255)
-        b = int(t * 255)
-    elif int(h) == 3:
-        r = int(p * 255)
-        g = int(q * 255)
-        b = int(fB * 255)
-    elif int(h) == 4:
-        r = int(t * 255)
-        g = int(p * 255)
-        b = int(fB * 255)
-    elif int(h) == 5:
-        r = int(fB * 255)
-        g = int(p * 255)
-        b = int(q * 255)
-
-    return (r, g, b)
-
-def convert_K_to_RGB(colour_temperature):
-    """
-    Converts from K to RGB, algorithm courtesy of 
-    https://gist.github.com/petrklus/b1f427accdf7438606a6 and
-    http://www.tannerhelland.com/4435/convert-temperature-rgb-algorithm-code/
-    """
-    #range check
-    if colour_temperature < 1000: 
-        colour_temperature = 1000
-    elif colour_temperature > 40000:
-        colour_temperature = 40000
-    
-    tmp_internal = colour_temperature / 100.0
-    
-    # red 
-    if tmp_internal <= 66:
-        r = int(255)
-    else:
-        tmp_red = 329.698727446 * math.pow(tmp_internal - 60, -0.1332047592)
-        if tmp_red < 0:
-            r = int(0)
-        elif tmp_red > 255:
-            r = int(255)
-        else:
-            r = int(tmp_red)
-    
-    # green
-    if tmp_internal <=66:
-        tmp_green = 99.4708025861 * math.log(tmp_internal) - 161.1195681661
-        if tmp_green < 0:
-            g = int(0)
-        elif tmp_green > 255:
-            g = int(255)
-        else:
-            g = int(tmp_green)
-    else:
-        tmp_green = 288.1221695283 * math.pow(tmp_internal - 60, -0.0755148492)
-        if tmp_green < 0:
-            g = int(0)
-        elif tmp_green > 255:
-            g = int(255)
-        else:
-            g = int(tmp_green)
-    
-    # blue
-    if tmp_internal >=66:
-        b = int(255)
-    elif tmp_internal <= 19:
-        b = int(0)
-    else:
-        tmp_blue = 138.5177312231 * math.log(tmp_internal - 10) - 305.0447927307
-        if tmp_blue < 0:
-            b = int(0)
-        elif tmp_blue > 255:
-            b = int(255)
-        else:
-            b = int(tmp_blue)
-    
-    return (r, g, b)
+    def setScene(self, idx, cmd):
+        self.api(
+            f"type=command&param=switchscene&idx={idx}&switchcmd={cmd}"
+        )
